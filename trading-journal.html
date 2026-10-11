@@ -526,9 +526,13 @@
             border-color: var(--accent-red);
         }
 
+        .modal:has(.screenshot-import-modal) {
+            max-width: 1000px;
+        }
+
         .screenshot-import-modal {
             display: grid;
-            grid-template-columns: 1fr 1fr;
+            grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
             gap: 20px;
             max-width: 900px;
         }
@@ -545,6 +549,25 @@
         .screenshot-preview img {
             width: 100%;
             border-radius: 4px;
+        }
+
+        .ai-status {
+            grid-column: 1 / -1;
+            font-size: 13px;
+            padding: 8px 12px;
+            border-radius: 6px;
+            border: 1px solid var(--border);
+            background: var(--bg-secondary);
+            color: var(--text-secondary);
+        }
+
+        .ai-status[data-state="working"] { border-color: var(--accent-yellow); }
+        .ai-status[data-state="done"] { border-color: var(--accent-green); color: var(--text-primary); }
+        .ai-status[data-state="error"] { border-color: var(--accent-red); }
+
+        .screenshot-form button[disabled] {
+            opacity: 0.5;
+            cursor: wait;
         }
 
         .screenshot-form {
@@ -630,7 +653,7 @@
             </nav>
             <div class="sidebar-footer">
                 <div id="sync-status" data-state="local">Saved on this computer only</div>
-                <button class="btn-import" id="import-btn">📷 Import Screenshot</button>
+                <button class="btn-import" id="import-btn" title="Or paste a screenshot with Cmd/Ctrl+V">📷 Import Screenshot</button>
             </div>
         </aside>
 
@@ -870,6 +893,7 @@
             <div class="screenshot-import-modal">
                 <div class="screenshot-preview" id="screenshot-preview"></div>
                 <form id="screenshot-form" class="screenshot-form">
+                    <div id="ai-status" class="ai-status" hidden></div>
                     <div class="form-group">
                         <label>Date</label>
                         <input type="date" id="screenshot-date" required>
@@ -1250,7 +1274,7 @@
                     direction: form.querySelector('[id$="-direction"]').value,
                     entryPrice: form.querySelector('[id$="-entry"]').value,
                     exitPrice: form.querySelector('[id$="-exit"]').value,
-                    pointValue: form.querySelector('[id$="-point-value"]').value || CONTRACTS[form.querySelector('[id$="-contract"]').value]?.pointValue || 0,
+                    pointValue: form.querySelector('[id$="-point-value"]')?.value || CONTRACTS[form.querySelector('[id$="-contract"]').value]?.pointValue || 0,
                     stopLoss: form.querySelector('[id$="-sl"]').value,
                     takeProfit: form.querySelector('[id$="-tp"]').value,
                     strategy: form.querySelector('[id$="-strategy"]')?.value || '',
@@ -1558,15 +1582,105 @@
         };
 
         const ScreenshotImport = {
+            pending: null,
             handleFile(file) {
                 const reader = new FileReader();
                 reader.onload = (e) => {
                     const dataUrl = e.target.result;
+                    document.getElementById('screenshot-form').reset();
                     document.getElementById('screenshot-preview').innerHTML = `<img src="${dataUrl}" style="width: 100%; border-radius: 4px;">`;
                     document.getElementById('import-modal').classList.add('active');
                     document.getElementById('screenshot-date').valueAsDate = new Date();
+                    this.readWithAI(file);
                 };
                 reader.readAsDataURL(file);
+            },
+            setStatus(text, state) {
+                const el = document.getElementById('ai-status');
+                el.textContent = text;
+                el.dataset.state = state || '';
+                el.hidden = !text;
+            },
+            // Ask Claude to read the trade off the screenshot and prefill the form.
+            // Only available when the journal is opened as its claude.ai page.
+            async readWithAI(file) {
+                this.setStatus('');
+                if (!window.claude?.use) return;
+                const sample = await window.claude.use('sample').catch(() => null);
+                const caps = sample && await sample.limits().catch(() => null);
+                if (!caps?.images) return;
+                if (!caps.images.mediaTypes.includes(file.type)) {
+                    this.setStatus('AI can only read PNG, JPEG, WebP or GIF screenshots. Fill in the trade below.', 'error');
+                    return;
+                }
+
+                this.pending?.abort();
+                const controller = new AbortController();
+                this.pending = controller;
+                const submit = document.querySelector('#screenshot-form button[type=submit]');
+                submit.disabled = true;
+                this.setStatus('Reading screenshot with AI…', 'working');
+
+                const contracts = Object.keys(CONTRACTS);
+                const prompt = `The attached image is a screenshot from a futures trading platform (an order history, positions panel, fill list, or chart with executions).
+Extract ONE completed trade from it: the most recent closed round trip if there are several.
+Reply with only a JSON object with exactly these keys:
+{"date": "YYYY-MM-DD" or null,
+ "contract": one of ${JSON.stringify(contracts)} or null (map month-coded symbols to the root, e.g. "MESZ6" -> "MES", "/MNQ" -> "MNQ"),
+ "direction": "long" or "short" or null (long = bought first, short = sold first),
+ "entryPrice": number or null,
+ "exitPrice": number or null,
+ "numContracts": integer or null,
+ "stopLoss": number or null,
+ "takeProfit": number or null,
+ "notes": short string noting anything uncertain, or ""}
+Use null for anything not clearly visible. Never guess numbers. Today's date is ${new Date().toISOString().slice(0, 10)}.`;
+
+                try {
+                    const t = await sample.json(prompt, { images: file, signal: controller.signal });
+                    if (this.pending !== controller) return;
+                    const filled = this.prefill(t || {});
+                    this.setStatus(filled
+                        ? `AI filled in ${filled} field(s). Check them against the screenshot before adding.`
+                        : 'AI could not find a trade in this screenshot. Fill in the trade below.',
+                        filled ? 'done' : 'error');
+                } catch (e) {
+                    if (e?.code === 'cancelled') return;
+                    const messages = {
+                        not_granted: 'AI reading was not allowed. Fill in the trade below.',
+                        image_rejected: 'AI could not open this image. Fill in the trade below.',
+                        rate_limited: 'AI is busy right now. Try again in a minute, or fill in the trade below.',
+                        refused: 'AI could not read this screenshot. Fill in the trade below.'
+                    };
+                    this.setStatus(messages[e?.code] || 'AI could not read this screenshot. Fill in the trade below.', 'error');
+                } finally {
+                    if (this.pending === controller) {
+                        this.pending = null;
+                        submit.disabled = false;
+                    }
+                }
+            },
+            prefill(t) {
+                let count = 0;
+                const set = (id, value) => {
+                    if (value === null || value === undefined || value === '') return;
+                    const el = document.getElementById(id);
+                    el.value = value;
+                    if (el.value === String(value)) count++;
+                };
+                const num = v => (typeof v === 'number' && isFinite(v) ? v : null);
+                if (typeof t.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(t.date)) set('screenshot-date', t.date);
+                if (CONTRACTS[t.contract]) set('screenshot-contract', t.contract);
+                if (t.direction === 'long' || t.direction === 'short') set('screenshot-direction', t.direction);
+                set('screenshot-entry', num(t.entryPrice));
+                set('screenshot-exit', num(t.exitPrice));
+                set('screenshot-contracts', Number.isInteger(t.numContracts) && t.numContracts > 0 ? t.numContracts : null);
+                set('screenshot-sl', num(t.stopLoss));
+                set('screenshot-tp', num(t.takeProfit));
+                if (typeof t.notes === 'string' && t.notes.trim()) {
+                    document.getElementById('screenshot-notes').value = 'AI: ' + t.notes.trim().slice(0, 500);
+                }
+                return count;
             }
         };
 
@@ -1587,6 +1701,14 @@
                 document.getElementById('import-btn').addEventListener('click', () => document.getElementById('csv-file-input').click());
                 document.getElementById('csv-file-input').addEventListener('change', (e) => {
                     if (e.target.files[0]) ScreenshotImport.handleFile(e.target.files[0]);
+                    e.target.value = '';
+                });
+
+                // Paste a screenshot straight from the clipboard (Cmd/Ctrl+V).
+                document.addEventListener('paste', (e) => {
+                    if (e.target.closest?.('input, textarea')) return;
+                    const item = [...(e.clipboardData?.items || [])].find(i => i.type.startsWith('image/'));
+                    if (item) ScreenshotImport.handleFile(item.getAsFile());
                 });
 
                 document.querySelectorAll('.modal-close').forEach(btn => {
